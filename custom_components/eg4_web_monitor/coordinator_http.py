@@ -846,3 +846,75 @@ class HTTPUpdateMixin(_MixinBase):
             task.add_done_callback(self._log_task_exception)
 
         return processed
+
+    # ── Storm mode: writeTime endpoint ─────────────────────────────────
+
+    async def write_time_parameter(
+        self,
+        serial: str,
+        time_param: str,
+        hour: int,
+        minute: int,
+    ) -> bool:
+        """Write a time parameter via the cloud API writeTime endpoint.
+
+        Calls POST /WManage/web/maintain/remoteSet/writeTime with
+        inverterSn, timeParam, hour, minute, clientType=WEB,
+        remoteSetType=NORMAL.
+
+        Args:
+            serial: Inverter serial number (master serial for GridBOSS).
+            time_param: Time parameter name (e.g. HOLD_AC_CHARGE_START_TIME).
+            hour: Hour value (0-23).
+            minute: Minute value (0-59).
+
+        Returns:
+            True on success.
+
+        Raises:
+            HomeAssistantError: If the cloud API is unavailable or the call fails.
+        """
+        from homeassistant.exceptions import HomeAssistantError
+        from homeassistant.helpers import aiohttp_client
+
+        if self.client is None:
+            raise HomeAssistantError(
+                "Cloud API not available — writeTime requires HTTP mode"
+            )
+
+        url = f"{self.client.base_url}/WManage/web/maintain/remoteSet/writeTime"
+        payload = {
+            "inverterSn": serial,
+            "timeParam": time_param,
+            "hour": str(hour).zfill(2),
+            "minute": str(minute).zfill(2),
+            "clientType": "WEB",
+            "remoteSetType": "NORMAL",
+        }
+
+        session = aiohttp_client.async_get_clientsession(self.hass)
+
+        _LOGGER.debug(
+            "writeTime %s=%02d:%02d for %s", time_param, hour, minute, serial
+        )
+
+        try:
+            async with session.post(url, data=payload) as resp:
+                if resp.status != 200:
+                    raise HomeAssistantError(
+                        f"writeTime failed with HTTP {resp.status} for {time_param}"
+                    )
+                body = await resp.json()
+                if not body.get("success"):
+                    raise HomeAssistantError(
+                        f"writeTime returned failure for {time_param}: {body}"
+                    )
+        except HomeAssistantError:
+            raise
+        except Exception as exc:
+            raise HomeAssistantError(
+                f"writeTime request failed for {time_param}: {exc}"
+            ) from exc
+
+        _LOGGER.debug("writeTime %s succeeded for %s", time_param, serial)
+        return True

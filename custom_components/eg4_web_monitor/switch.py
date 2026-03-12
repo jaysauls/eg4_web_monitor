@@ -178,6 +178,17 @@ async def async_setup_entry(
     if entities:
         async_add_entities(entities)
 
+    # Create storm mode switches for all devices with cloud API
+    storm_entities: list[SwitchEntity] = []
+    if coordinator.has_http_api():
+        for serial, device_data in coordinator.data["devices"].items():
+            device_type = device_data.get("type", "unknown")
+            if device_type in ("inverter", "gridboss"):
+                storm_entities.append(EG4StormModeSwitch(coordinator, serial))
+
+    if storm_entities:
+        async_add_entities(storm_entities)
+
 
 class EG4QuickChargeSwitch(EG4BaseSwitch):
     """Switch to control quick charge functionality."""
@@ -707,3 +718,89 @@ class EG4DSTSwitch(CoordinatorEntity[EG4DataUpdateCoordinator], SwitchEntity):
             raise HomeAssistantError(
                 f"Failed to {action.lower()} Daylight Saving Time: {e}"
             ) from e
+
+
+class EG4StormModeSwitch(EG4BaseSwitch):
+    """Switch to enable/disable storm mode.
+
+    Storm mode overrides the AC charge schedule to force near-24h grid
+    charging.  The original schedule is saved to persistent storage and
+    restored when storm mode is disabled.
+    """
+
+    def __init__(
+        self,
+        coordinator: EG4DataUpdateCoordinator,
+        serial: str,
+    ) -> None:
+        """Initialize the storm mode switch."""
+        super().__init__(
+            coordinator=coordinator,
+            serial=serial,
+            entity_key="storm_mode",
+            name="Storm Mode",
+            icon="mdi:weather-hurricane",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True if storm mode is active."""
+        if self._optimistic_state is not None:
+            return self._optimistic_state
+
+        from .services import is_storm_mode_active
+
+        return is_storm_mode_active(self.coordinator.entry, self._serial)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Enable storm mode."""
+        from .services import async_set_storm_mode
+
+        self._optimistic_state = True
+        self.async_write_ha_state()
+
+        try:
+            # Build a minimal ServiceCall-like object
+            call = _StormModeCallData(
+                serial=self._serial, enable=True
+            )
+            await async_set_storm_mode(self.hass, call)
+        except Exception:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            raise
+        finally:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Disable storm mode."""
+        from .services import async_set_storm_mode
+
+        self._optimistic_state = False
+        self.async_write_ha_state()
+
+        try:
+            call = _StormModeCallData(
+                serial=self._serial, enable=False
+            )
+            await async_set_storm_mode(self.hass, call)
+        except Exception:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            raise
+        finally:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Storm mode requires cloud API."""
+        return self.coordinator.has_http_api()
+
+
+class _StormModeCallData:
+    """Lightweight stand-in for ServiceCall.data used by the switch."""
+
+    def __init__(self, serial: str, enable: bool) -> None:
+        self.data: dict[str, Any] = {"serial": serial, "enable": enable}

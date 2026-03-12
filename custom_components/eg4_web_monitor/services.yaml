@@ -49,3 +49,37 @@ reconcile_history:
       required: false
       selector:
         text:
+
+set_storm_mode:
+  name: Set Storm Mode
+  description: >-
+    Enable or disable storm mode for an EG4 device. When enabled, the AC charge
+    schedule is overridden to charge the battery from the grid around the clock
+    (00:00–23:59). The original schedule is saved and restored when storm mode is
+    disabled. Requires cloud credentials (HTTP or Hybrid connection mode).
+  fields:
+    serial:
+      name: Device Serial
+      description: Serial number of the inverter or GridBOSS device.
+      required: true
+      example: "1234567890"
+      selector:
+        text:
+    enable:
+      name: Enable
+      description: Set to true to enable storm mode, false to disable and restore the previous schedule.
+      required: true
+      selector:
+        boolean:
+    soc_limit:
+      name: SOC Limit
+      description: "Battery SOC charge limit while storm mode is active (default: 100%)."
+      required: false
+      default: 100
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          mode: box
+          unit_of_measurement: "%"

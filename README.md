@@ -53,6 +53,7 @@ No technical knowledge of solar systems is required - if you can use the EG4 Mon
 - **Fast Local Polling**: 5-second updates via Modbus, dongle, or serial — no internet dependency
 - **Hybrid Mode**: Enrich local data with cloud features like DST auto-sync and quick charge control
 - **Data Integrity**: WiFi dongle cross-request validation, canary checks, and energy monotonicity guards protect against corrupt readings
+- **Storm Mode**: Automated storm preparation — force near-24h AC charging during severe weather, then auto-restore the previous schedule
 - **Control & Automation**: Quick charge, battery backup (EPS), operating modes, SOC limits, and GridBOSS smart port configuration
 - **BMS Diagnostics**: Bank-level cell voltage, temperature, current limits, cycle count — always available, no CAN bus needed
 - **Battery Tracking**: Round-robin battery cache with per-battery last-seen timestamps for >4 battery systems
@@ -298,6 +299,7 @@ After initial setup, you can customize polling intervals:
 - **Quick Charge**: Start/stop battery quick charging
 - **Battery Backup (EPS)**: Enable/disable emergency power supply mode
 - **Daylight Saving Time**: Enable/disable DST for station time synchronization
+- **Storm Mode**: Enable/disable storm mode — forces near-24h AC grid charging and saves/restores the original schedule (requires cloud API)
 - **Working Mode Switches**:
   - **AC Charge Mode**: Enable/disable AC charging from grid
   - **PV Charge Priority**: Enable/disable solar charging priority
@@ -349,6 +351,39 @@ service: eg4_web_monitor.refresh_data
 - Refresh after physical device changes
 - Automation triggers requiring fresh data
 
+### eg4_web_monitor.set_storm_mode
+
+Enable or disable **storm mode** for an EG4 device. When enabled, the AC charge schedule is overridden to charge the battery from the grid around the clock (00:00–23:59), FUNC_AC_CHARGE is enabled if needed, and the SOC limit is raised to 100%. The original schedule, AC charge state, and SOC limit are saved and automatically restored when storm mode is disabled. Requires cloud credentials (HTTP or Hybrid connection mode).
+
+**Parameters:**
+- **serial** (required, string): Serial number of the inverter or GridBOSS device.
+- **enable** (required, boolean): `true` to enable storm mode, `false` to disable and restore the previous schedule.
+- **soc_limit** (optional, integer, default: 100): AC charge SOC limit to set when enabling (0–100%).
+
+**Example usage:**
+
+Enable storm mode:
+```yaml
+service: eg4_web_monitor.set_storm_mode
+data:
+  serial: "1234567890"
+  enable: true
+```
+
+Disable storm mode and restore the previous schedule:
+```yaml
+service: eg4_web_monitor.set_storm_mode
+data:
+  serial: "1234567890"
+  enable: false
+```
+
+**How it works:**
+1. **Enable:** Saves the current AC charge schedule (all 3 time slots), FUNC_AC_CHARGE state, and SOC limit as a baseline. Sets T1 to 00:00–23:59, clears T2/T3, enables FUNC_AC_CHARGE if off, and raises the SOC limit.
+2. **Disable:** Restores all 3 time slots, the original FUNC_AC_CHARGE state, and the original SOC limit from the saved baseline.
+3. **Persistence:** The baseline is stored in the config entry and survives Home Assistant restarts.
+4. **GridBOSS:** For GridBOSS devices, control writes are automatically routed to the master inverter serial.
+
 ## Entity Examples
 
 ```yaml
@@ -383,6 +418,9 @@ switch.18kpv_1234567890_battery_backup_ctrl
 
 # Station controls
 switch.eg4_station_daylight_saving_time
+
+# Storm mode
+switch.18kpv_1234567890_storm_mode
 ```
 
 ## Supported Devices
@@ -449,6 +487,48 @@ automation:
       - service: switch.turn_on
         target:
           entity_id: switch.18kpv_1234567890_battery_backup
+```
+
+### Storm Preparation with NWS Weather Alerts
+
+Use a weather alert integration (e.g., [NWS Alerts](https://github.com/finity69x2/nws_alerts)) to automatically enable storm mode when severe weather is forecasted, then restore the normal schedule when the warning expires.
+
+```yaml
+automation:
+  - alias: "Storm Mode On — Severe Weather Warning"
+    trigger:
+      - platform: state
+        entity_id: sensor.nws_alerts
+    condition:
+      - condition: template
+        value_template: >
+          {{ 'Severe Thunderstorm' in state_attr('sensor.nws_alerts', 'title')
+             or 'Tornado' in state_attr('sensor.nws_alerts', 'title')
+             or 'Hurricane' in state_attr('sensor.nws_alerts', 'title') }}
+    action:
+      - service: eg4_web_monitor.set_storm_mode
+        data:
+          serial: "1234567890"
+          enable: true
+
+  - alias: "Storm Mode Off — Weather Alert Cleared"
+    trigger:
+      - platform: state
+        entity_id: sensor.nws_alerts
+    condition:
+      - condition: state
+        entity_id: switch.18kpv_1234567890_storm_mode
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ 'Severe Thunderstorm' not in state_attr('sensor.nws_alerts', 'title')
+             and 'Tornado' not in state_attr('sensor.nws_alerts', 'title')
+             and 'Hurricane' not in state_attr('sensor.nws_alerts', 'title') }}
+    action:
+      - service: eg4_web_monitor.set_storm_mode
+        data:
+          serial: "1234567890"
+          enable: false
 ```
 
 ## Frequently Asked Questions

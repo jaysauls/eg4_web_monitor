@@ -759,6 +759,12 @@
     },
     "invalid_date_format": {
       "message": "Invalid date format. Please use YYYY-MM-DD format."
+    },
+    "device_not_found": {
+      "message": "No EG4 device found with serial {serial}. Please verify the serial number."
+    },
+    "storm_mode_not_active": {
+      "message": "Storm mode is not active for device {serial}. Cannot disable."
     }
   },
   "issues": {

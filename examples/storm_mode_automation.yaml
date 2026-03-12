@@ -1,0 +1,79 @@
+# Storm Mode Automation Example
+#
+# Uses the NWS Alerts custom integration to detect severe weather warnings
+# and automatically enable storm mode on your EG4 equipment.
+#
+# Prerequisites:
+# - EG4 Web Monitor integration with cloud API (HTTP or Hybrid connection)
+# - NWS Alerts custom integration (https://github.com/finity69x2/nws_alerts)
+#
+# Replace "1234567890" with your actual inverter or GridBOSS serial number.
+# Replace sensor/switch entity names to match your setup.
+
+automation:
+  # ─── Enable storm mode when severe weather is forecasted ───────────
+  - alias: "EG4 Storm Mode On — Severe Weather Warning"
+    description: >
+      Forces the battery to charge from the grid around the clock when a
+      severe weather warning is active. Saves the current AC charge schedule
+      so it can be restored later.
+    trigger:
+      - platform: state
+        entity_id: sensor.nws_alerts
+    condition:
+      # Only trigger when storm mode is not already on
+      - condition: state
+        entity_id: switch.18kpv_1234567890_storm_mode
+        state: "off"
+      # Check for relevant weather events
+      - condition: template
+        value_template: >
+          {{ 'Severe Thunderstorm' in state_attr('sensor.nws_alerts', 'title')
+             or 'Tornado' in state_attr('sensor.nws_alerts', 'title')
+             or 'Hurricane' in state_attr('sensor.nws_alerts', 'title')
+             or 'Tropical Storm' in state_attr('sensor.nws_alerts', 'title') }}
+    action:
+      - service: eg4_web_monitor.set_storm_mode
+        data:
+          serial: "1234567890"
+          enable: true
+          soc_limit: 100
+      - service: notify.mobile_app
+        data:
+          title: "⛈️ Storm Mode Activated"
+          message: >
+            Severe weather detected. Battery is now charging from the grid
+            around the clock. Normal schedule will be restored when the
+            warning clears.
+
+  # ─── Disable storm mode when the warning expires ───────────────────
+  - alias: "EG4 Storm Mode Off — Weather Alert Cleared"
+    description: >
+      Restores the previous AC charge schedule, FUNC_AC_CHARGE state, and
+      SOC limit when the severe weather warning is no longer active.
+    trigger:
+      - platform: state
+        entity_id: sensor.nws_alerts
+    condition:
+      # Only trigger when storm mode is actually on
+      - condition: state
+        entity_id: switch.18kpv_1234567890_storm_mode
+        state: "on"
+      # No relevant weather events remain
+      - condition: template
+        value_template: >
+          {{ 'Severe Thunderstorm' not in state_attr('sensor.nws_alerts', 'title')
+             and 'Tornado' not in state_attr('sensor.nws_alerts', 'title')
+             and 'Hurricane' not in state_attr('sensor.nws_alerts', 'title')
+             and 'Tropical Storm' not in state_attr('sensor.nws_alerts', 'title') }}
+    action:
+      - service: eg4_web_monitor.set_storm_mode
+        data:
+          serial: "1234567890"
+          enable: false
+      - service: notify.mobile_app
+        data:
+          title: "☀️ Storm Mode Deactivated"
+          message: >
+            Weather warning cleared. Normal AC charge schedule has been
+            restored.

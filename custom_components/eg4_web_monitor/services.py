@@ -16,7 +16,7 @@ from homeassistant.components.recorder.statistics import (
     async_import_statistics,
     statistics_during_period,
 )
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
@@ -24,10 +24,13 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    AC_CHARGE_TIME_SLOTS,
     CONF_CONNECTION_TYPE,
+    CONF_STORM_MODE,
     CONNECTION_TYPE_HTTP,
     CONNECTION_TYPE_HYBRID,
     DOMAIN,
+    STORM_SOC_LIMIT_DEFAULT,
 )
 
 if TYPE_CHECKING:
@@ -713,3 +716,323 @@ def _transform_to_statistics(
             )
 
     return statistics
+
+
+# =============================================================================
+# Storm Mode Service
+# =============================================================================
+
+def _get_storm_mode_data(
+    entry: ConfigEntry,
+) -> dict[str, Any]:
+    """Get storm mode data from config entry options.
+
+    Returns the storm_mode dict (possibly empty) from entry.options.
+    """
+    return dict(entry.options.get(CONF_STORM_MODE, {}))
+
+
+def is_storm_mode_active(entry: ConfigEntry, serial: str) -> bool:
+    """Check if storm mode is currently active for a device."""
+    storm_data = _get_storm_mode_data(entry)
+    device_data = storm_data.get(serial, {})
+    return bool(device_data.get("active", False))
+
+
+def _save_storm_mode_data(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    storm_data: dict[str, Any],
+) -> None:
+    """Persist storm mode data into config entry options."""
+    new_options = dict(entry.options)
+    new_options[CONF_STORM_MODE] = storm_data
+    hass.config_entries.async_update_entry(entry, options=new_options)
+
+
+def _read_schedule_baseline(
+    parameters: dict[str, Any],
+) -> list[dict[str, int]]:
+    """Read current AC charge schedule time slots from parameter data.
+
+    Returns a list of 3 dicts, each with start_hour, start_minute,
+    end_hour, end_minute parsed from the coordinator parameter data.
+    """
+    slots: list[dict[str, int]] = []
+    for slot_def in AC_CHARGE_TIME_SLOTS:
+        slots.append(
+            {
+                "start_hour": int(parameters.get(slot_def["read_start_hour"], "0")),
+                "start_minute": int(
+                    parameters.get(slot_def["read_start_minute"], "0")
+                ),
+                "end_hour": int(parameters.get(slot_def["read_end_hour"], "0")),
+                "end_minute": int(parameters.get(slot_def["read_end_minute"], "0")),
+            }
+        )
+    return slots
+
+
+def _resolve_control_serial(
+    coordinator: EG4DataUpdateCoordinator,
+    serial: str,
+) -> str:
+    """Resolve the serial to use for control operations.
+
+    For GridBOSS devices, control writes target the master inverter serial.
+    For standard inverters, the serial is used directly.
+    """
+    if not coordinator.data or "devices" not in coordinator.data:
+        return serial
+
+    device_data = coordinator.data["devices"].get(serial, {})
+    device_type = device_data.get("type", "unknown")
+
+    if device_type == "gridboss":
+        master_sn = device_data.get("master_inverter_sn")
+        if master_sn:
+            _LOGGER.debug(
+                "GridBOSS %s: routing control to master inverter %s",
+                serial,
+                master_sn,
+            )
+            return master_sn
+
+    return serial
+
+
+async def async_set_storm_mode(
+    hass: HomeAssistant,
+    call: ServiceCall,
+) -> None:
+    """Handle the set_storm_mode service call.
+
+    When enabling storm mode:
+    1. Read current AC charge schedule and FUNC_AC_CHARGE state
+    2. Save baseline to persistent storage
+    3. Enable FUNC_AC_CHARGE if needed
+    4. Set schedule to 00:00-23:59 (near 24h coverage), clear other slots
+    5. Optionally raise SOC limit
+
+    When disabling storm mode:
+    1. Restore all saved time parameters
+    2. Restore FUNC_AC_CHARGE to baseline state
+    3. Restore SOC limit
+    4. Clear storm mode state
+    """
+    serial: str = call.data["serial"]
+    enable: bool = call.data["enable"]
+    soc_limit: int = call.data.get("soc_limit", STORM_SOC_LIMIT_DEFAULT)
+
+    # Find the coordinator for this serial
+    coordinator = _find_coordinator_for_serial(hass, serial)
+    if coordinator is None:
+        raise ServiceValidationError(
+            f"No EG4 device found with serial {serial}",
+            translation_domain=DOMAIN,
+            translation_key="device_not_found",
+        )
+
+    entry = coordinator.entry
+    control_serial = _resolve_control_serial(coordinator, serial)
+
+    if enable:
+        await _enable_storm_mode(
+            hass, coordinator, entry, serial, control_serial, soc_limit
+        )
+    else:
+        await _disable_storm_mode(hass, coordinator, entry, serial, control_serial)
+
+
+def _find_coordinator_for_serial(
+    hass: HomeAssistant,
+    serial: str,
+) -> EG4DataUpdateCoordinator | None:
+    """Find the coordinator that owns a particular device serial."""
+    for config_entry in hass.config_entries.async_entries(DOMAIN):
+        if config_entry.state != ConfigEntryState.LOADED:
+            continue
+        coordinator = config_entry.runtime_data
+        if (
+            coordinator.data
+            and "devices" in coordinator.data
+            and serial in coordinator.data["devices"]
+        ):
+            return coordinator
+    return None
+
+
+async def _enable_storm_mode(
+    hass: HomeAssistant,
+    coordinator: EG4DataUpdateCoordinator,
+    entry: ConfigEntry,
+    serial: str,
+    control_serial: str,
+    soc_limit: int,
+) -> None:
+    """Enable storm mode for a device."""
+    if is_storm_mode_active(entry, serial):
+        _LOGGER.info("Storm mode already active for %s, re-snapshotting baseline", serial)
+
+    if not coordinator.has_http_api():
+        raise HomeAssistantError(
+            "Storm mode requires cloud API access (HTTP or Hybrid mode)"
+        )
+
+    # Read current parameters
+    params = {}
+    if coordinator.data and "parameters" in coordinator.data:
+        params = coordinator.data["parameters"].get(control_serial, {})
+
+    # Capture baseline
+    ac_charge_enabled = bool(params.get("FUNC_AC_CHARGE", False))
+    current_soc_limit = params.get("HOLD_AC_CHARGE_SOC_LIMIT")
+    time_slots = _read_schedule_baseline(params)
+
+    baseline = {
+        "active": True,
+        "ac_charge_enabled": ac_charge_enabled,
+        "soc_limit": current_soc_limit,
+        "time_slots": time_slots,
+    }
+
+    # Persist baseline
+    storm_data = _get_storm_mode_data(entry)
+    storm_data[serial] = baseline
+    _save_storm_mode_data(hass, entry, storm_data)
+
+    _LOGGER.info(
+        "Storm mode ENABLE for %s (control serial %s): baseline saved",
+        serial,
+        control_serial,
+    )
+
+    # Step 1: Enable FUNC_AC_CHARGE if not already enabled
+    if not ac_charge_enabled:
+        inverter = coordinator.get_inverter_object(control_serial)
+        if inverter and hasattr(inverter, "enable_ac_charge_mode"):
+            await inverter.enable_ac_charge_mode()
+            _LOGGER.debug("Enabled FUNC_AC_CHARGE for %s", control_serial)
+            await asyncio.sleep(1.0)
+
+    # Step 2: Set T1 to 00:00-23:59
+    from .const.storm_mode import (
+        STORM_SCHEDULE_END_HOUR,
+        STORM_SCHEDULE_END_MINUTE,
+        STORM_SCHEDULE_START_HOUR,
+        STORM_SCHEDULE_START_MINUTE,
+        CLEAR_HOUR,
+        CLEAR_MINUTE,
+    )
+
+    await coordinator.write_time_parameter(
+        control_serial,
+        AC_CHARGE_TIME_SLOTS[0]["write_start"],
+        STORM_SCHEDULE_START_HOUR,
+        STORM_SCHEDULE_START_MINUTE,
+    )
+    await asyncio.sleep(0.5)
+
+    await coordinator.write_time_parameter(
+        control_serial,
+        AC_CHARGE_TIME_SLOTS[0]["write_end"],
+        STORM_SCHEDULE_END_HOUR,
+        STORM_SCHEDULE_END_MINUTE,
+    )
+    await asyncio.sleep(0.5)
+
+    # Step 3: Clear T2 and T3
+    for slot in AC_CHARGE_TIME_SLOTS[1:]:
+        await coordinator.write_time_parameter(
+            control_serial, slot["write_start"], CLEAR_HOUR, CLEAR_MINUTE
+        )
+        await asyncio.sleep(0.3)
+        await coordinator.write_time_parameter(
+            control_serial, slot["write_end"], CLEAR_HOUR, CLEAR_MINUTE
+        )
+        await asyncio.sleep(0.3)
+
+    # Step 4: Set SOC limit to storm value
+    if soc_limit is not None:
+        inverter = coordinator.get_inverter_object(control_serial)
+        if inverter and hasattr(inverter, "set_ac_charge_soc_limit"):
+            await inverter.set_ac_charge_soc_limit(soc_percent=soc_limit)
+            _LOGGER.debug("Set AC charge SOC limit to %d%% for %s", soc_limit, control_serial)
+
+    # Refresh coordinator to pick up new state
+    await coordinator.async_request_refresh()
+    _LOGGER.info("Storm mode ENABLED for %s", serial)
+
+
+async def _disable_storm_mode(
+    hass: HomeAssistant,
+    coordinator: EG4DataUpdateCoordinator,
+    entry: ConfigEntry,
+    serial: str,
+    control_serial: str,
+) -> None:
+    """Disable storm mode and restore baseline for a device."""
+    if not is_storm_mode_active(entry, serial):
+        raise ServiceValidationError(
+            f"Storm mode is not active for {serial}",
+            translation_domain=DOMAIN,
+            translation_key="storm_mode_not_active",
+        )
+
+    storm_data = _get_storm_mode_data(entry)
+    baseline = storm_data.get(serial, {})
+    time_slots = baseline.get("time_slots", [])
+
+    _LOGGER.info(
+        "Storm mode DISABLE for %s (control serial %s): restoring baseline",
+        serial,
+        control_serial,
+    )
+
+    # Step 1: Restore time slots
+    for i, slot in enumerate(AC_CHARGE_TIME_SLOTS):
+        if i < len(time_slots):
+            saved = time_slots[i]
+            await coordinator.write_time_parameter(
+                control_serial,
+                slot["write_start"],
+                saved.get("start_hour", 0),
+                saved.get("start_minute", 0),
+            )
+            await asyncio.sleep(0.3)
+            await coordinator.write_time_parameter(
+                control_serial,
+                slot["write_end"],
+                saved.get("end_hour", 0),
+                saved.get("end_minute", 0),
+            )
+            await asyncio.sleep(0.3)
+
+    # Step 2: Restore FUNC_AC_CHARGE to baseline state
+    ac_charge_baseline = baseline.get("ac_charge_enabled", False)
+    if not ac_charge_baseline:
+        inverter = coordinator.get_inverter_object(control_serial)
+        if inverter and hasattr(inverter, "disable_ac_charge_mode"):
+            await inverter.disable_ac_charge_mode()
+            _LOGGER.debug("Disabled FUNC_AC_CHARGE for %s", control_serial)
+            await asyncio.sleep(1.0)
+
+    # Step 3: Restore SOC limit
+    saved_soc = baseline.get("soc_limit")
+    if saved_soc is not None:
+        inverter = coordinator.get_inverter_object(control_serial)
+        if inverter and hasattr(inverter, "set_ac_charge_soc_limit"):
+            await inverter.set_ac_charge_soc_limit(soc_percent=int(saved_soc))
+            _LOGGER.debug(
+                "Restored AC charge SOC limit to %s%% for %s",
+                saved_soc,
+                control_serial,
+            )
+
+    # Clear storm mode state
+    del storm_data[serial]
+    _save_storm_mode_data(hass, entry, storm_data)
+
+    # Refresh coordinator
+    await coordinator.async_request_refresh()
+    _LOGGER.info("Storm mode DISABLED for %s — baseline restored", serial)

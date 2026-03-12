@@ -25,7 +25,7 @@ from .const import (
     MIN_HTTP_POLLING_INTERVAL,
 )
 from .coordinator import EG4DataUpdateCoordinator
-from .services import async_reconcile_history
+from .services import async_reconcile_history, async_set_storm_mode
 from ._config_flow.helpers import migrate_legacy_entry
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +65,7 @@ _DEPRECATED_CHARGE_DISCHARGE_SUFFIXES: frozenset[str] = frozenset(
 
 SERVICE_REFRESH_DATA = "refresh_data"
 SERVICE_RECONCILE_HISTORY = "reconcile_history"
+SERVICE_SET_STORM_MODE = "set_storm_mode"
 
 REFRESH_DATA_SCHEMA = vol.Schema(
     {
@@ -80,6 +81,16 @@ RECONCILE_HISTORY_SCHEMA = vol.Schema(
         vol.Optional("start_date"): cv.string,
         vol.Optional("end_date"): cv.string,
         vol.Optional("entry_id"): cv.string,
+    }
+)
+
+SET_STORM_MODE_SCHEMA = vol.Schema(
+    {
+        vol.Required("serial"): cv.string,
+        vol.Required("enable"): cv.boolean,
+        vol.Optional("soc_limit", default=100): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=100)
+        ),
     }
 )
 
@@ -158,6 +169,18 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         SERVICE_RECONCILE_HISTORY,
         handle_reconcile_history,
         schema=RECONCILE_HISTORY_SCHEMA,
+    )
+
+    # Register set_storm_mode service
+    async def handle_set_storm_mode(call: ServiceCall) -> None:
+        """Handle set_storm_mode service call."""
+        await async_set_storm_mode(hass, call)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_STORM_MODE,
+        handle_set_storm_mode,
+        schema=SET_STORM_MODE_SCHEMA,
     )
 
     return True
