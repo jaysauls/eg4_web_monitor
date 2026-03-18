@@ -198,7 +198,7 @@ async def async_setup_entry(
                     port_status = device_data.get("sensors", {}).get(
                         f"smart_port{port}_status"
                     )
-                    if port_status is not None and int(port_status) == 1:
+                    if port_status == "smart_load":
                         smart_load_entities.append(
                             EG4SmartLoadSwitch(coordinator, serial, port)
                         )
@@ -860,7 +860,7 @@ class EG4SmartLoadSwitch(EG4BaseSwitch):
             f"smart_port{self._port}_status"
         )
         if status is not None:
-            return int(status) == 1
+            return status == "smart_load"
         return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:

@@ -744,7 +744,8 @@ def _mock_gridboss_coordinator(
     coordinator.data["devices"][serial]["type"] = "gridboss"
 
     # Set smart port statuses inside "sensors" dict (mirrors real coordinator structure)
-    statuses = port_statuses or {1: 0, 2: 1, 3: 0, 4: 0}
+    # Values are strings: "unused", "smart_load", "ac_couple" (coordinator converts ints)
+    statuses = port_statuses or {1: "unused", 2: "smart_load", 3: "unused", 4: "unused"}
     sensors = coordinator.data["devices"][serial].setdefault("sensors", {})
     for port, status in statuses.items():
         sensors[f"smart_port{port}_status"] = status
@@ -764,13 +765,17 @@ class TestSmartLoadSwitch:
 
     def test_is_on_when_port_active(self):
         """Port with status 1 (smart_load) should report is_on True."""
-        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 1, 3: 0, 4: 0})
+        coordinator = _mock_gridboss_coordinator(
+            port_statuses={1: "unused", 2: "smart_load", 3: "unused", 4: "unused"}
+        )
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         assert switch.is_on is True
 
     def test_is_off_when_port_disabled(self):
         """Port with status 0 (unused) should report is_on False."""
-        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 0, 3: 0, 4: 0})
+        coordinator = _mock_gridboss_coordinator(
+            port_statuses={1: "unused", 2: "unused", 3: "unused", 4: "unused"}
+        )
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         assert switch.is_on is False
 
@@ -784,7 +789,9 @@ class TestSmartLoadSwitch:
 
     def test_optimistic_overrides(self):
         """Optimistic state takes precedence over actual state."""
-        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 0, 3: 0, 4: 0})
+        coordinator = _mock_gridboss_coordinator(
+            port_statuses={1: "unused", 2: "unused", 3: "unused", 4: "unused"}
+        )
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         switch._optimistic_state = True
         assert switch.is_on is True
@@ -850,7 +857,14 @@ class TestSmartLoadSwitch:
     @pytest.mark.asyncio
     async def test_setup_creates_smart_load_switches(self, hass):
         """Smart load switches should be created for active smart load ports."""
-        coordinator = _mock_gridboss_coordinator(port_statuses={1: 1, 2: 1, 3: 0, 4: 2})
+        coordinator = _mock_gridboss_coordinator(
+            port_statuses={
+                1: "smart_load",
+                2: "smart_load",
+                3: "unused",
+                4: "ac_couple",
+            }
+        )
         entry = MagicMock()
         entry.runtime_data = coordinator
 
@@ -866,7 +880,9 @@ class TestSmartLoadSwitch:
     @pytest.mark.asyncio
     async def test_setup_skips_when_no_active_ports(self, hass):
         """No smart load switches if no ports have status 1."""
-        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 0, 3: 0, 4: 2})
+        coordinator = _mock_gridboss_coordinator(
+            port_statuses={1: "unused", 2: "unused", 3: "unused", 4: "ac_couple"}
+        )
         entry = MagicMock()
         entry.runtime_data = coordinator
 
