@@ -743,10 +743,11 @@ def _mock_gridboss_coordinator(
     # Override device type to gridboss
     coordinator.data["devices"][serial]["type"] = "gridboss"
 
-    # Set smart port statuses (default: port 2 is smart_load)
+    # Set smart port statuses inside "sensors" dict (mirrors real coordinator structure)
     statuses = port_statuses or {1: 0, 2: 1, 3: 0, 4: 0}
+    sensors = coordinator.data["devices"][serial].setdefault("sensors", {})
     for port, status in statuses.items():
-        coordinator.data["devices"][serial][f"smart_port{port}_status"] = status
+        sensors[f"smart_port{port}_status"] = status
 
     # Mock MID device object with smart load methods
     mock_mid = MagicMock()
@@ -777,7 +778,7 @@ class TestSmartLoadSwitch:
         """Missing port status should return None."""
         coordinator = _mock_gridboss_coordinator()
         # Remove the port status key
-        del coordinator.data["devices"]["4434850035"]["smart_port2_status"]
+        del coordinator.data["devices"]["4434850035"]["sensors"]["smart_port2_status"]
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         assert switch.is_on is None
 

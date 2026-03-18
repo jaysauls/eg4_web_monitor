@@ -195,7 +195,9 @@ async def async_setup_entry(
         for serial, device_data in coordinator.data["devices"].items():
             if device_data.get("type") == "gridboss":
                 for port in range(1, 5):
-                    port_status = device_data.get(f"smart_port{port}_status")
+                    port_status = device_data.get("sensors", {}).get(
+                        f"smart_port{port}_status"
+                    )
                     if port_status is not None and int(port_status) == 1:
                         smart_load_entities.append(
                             EG4SmartLoadSwitch(coordinator, serial, port)
@@ -854,7 +856,9 @@ class EG4SmartLoadSwitch(EG4BaseSwitch):
             return self._optimistic_state
 
         # Port status of 1 (smart_load) means the port is active/enabled
-        status = self._device_data.get(f"smart_port{self._port}_status")
+        status = self._device_data.get("sensors", {}).get(
+            f"smart_port{self._port}_status"
+        )
         if status is not None:
             return int(status) == 1
         return None
