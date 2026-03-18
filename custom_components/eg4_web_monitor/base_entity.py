@@ -825,6 +825,23 @@ class EG4BaseSwitch(CoordinatorEntity, SwitchEntity):
             raise HomeAssistantError(f"Inverter {self._serial} not found")
         return inverter
 
+    def _get_device_or_raise(self) -> Any:
+        """Get device object (inverter or MID/GridBOSS) or raise HomeAssistantError.
+
+        Unlike _get_inverter_or_raise which only returns inverters, this method
+        also supports MID/GridBOSS devices via the coordinator's device lookup.
+
+        Returns:
+            The device object (BaseInverter or MIDDevice).
+
+        Raises:
+            HomeAssistantError: If device is not found.
+        """
+        device = self.coordinator._get_device_object(self._serial)
+        if not device:
+            raise HomeAssistantError(f"Device {self._serial} not found")
+        return device
+
     async def _execute_switch_action(
         self,
         action_name: str,

@@ -189,6 +189,21 @@ async def async_setup_entry(
     if storm_entities:
         async_add_entities(storm_entities)
 
+    # Create smart load switches for GridBOSS devices with active smart load ports
+    smart_load_entities: list[SwitchEntity] = []
+    if coordinator.has_http_api():
+        for serial, device_data in coordinator.data["devices"].items():
+            if device_data.get("type") == "gridboss":
+                for port in range(1, 5):
+                    port_status = device_data.get(f"smart_port{port}_status")
+                    if port_status is not None and int(port_status) == 1:
+                        smart_load_entities.append(
+                            EG4SmartLoadSwitch(coordinator, serial, port)
+                        )
+
+    if smart_load_entities:
+        async_add_entities(smart_load_entities)
+
 
 class EG4QuickChargeSwitch(EG4BaseSwitch):
     """Switch to control quick charge functionality."""
@@ -761,9 +776,7 @@ class EG4StormModeSwitch(EG4BaseSwitch):
 
         try:
             # Build a minimal ServiceCall-like object
-            call = _StormModeCallData(
-                serial=self._serial, enable=True
-            )
+            call = _StormModeCallData(serial=self._serial, enable=True)
             await async_set_storm_mode(self.hass, call)
         except Exception:
             self._optimistic_state = None
@@ -781,9 +794,7 @@ class EG4StormModeSwitch(EG4BaseSwitch):
         self.async_write_ha_state()
 
         try:
-            call = _StormModeCallData(
-                serial=self._serial, enable=False
-            )
+            call = _StormModeCallData(serial=self._serial, enable=False)
             await async_set_storm_mode(self.hass, call)
         except Exception:
             self._optimistic_state = None
@@ -804,3 +815,146 @@ class _StormModeCallData:
 
     def __init__(self, serial: str, enable: bool) -> None:
         self.data: dict[str, Any] = {"serial": serial, "enable": enable}
+
+
+class EG4SmartLoadSwitch(EG4BaseSwitch):
+    """Switch to enable/disable a GridBOSS smart load port.
+
+    Each smart load port (1-4) on a GridBOSS MID device can be independently
+    enabled or disabled via the cloud API.  One switch entity is created per
+    active smart load port (port status == 1).
+    """
+
+    def __init__(
+        self,
+        coordinator: EG4DataUpdateCoordinator,
+        serial: str,
+        port: int,
+    ) -> None:
+        """Initialize the smart load switch.
+
+        Args:
+            coordinator: The data update coordinator.
+            serial: The GridBOSS device serial number.
+            port: Smart load port number (1-4).
+        """
+        self._port = port
+        super().__init__(
+            coordinator=coordinator,
+            serial=serial,
+            entity_key=f"smart_load_{port}",
+            name=f"Smart Load {port}",
+            icon="mdi:lightning-bolt",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True if smart load port is enabled."""
+        if self._optimistic_state is not None:
+            return self._optimistic_state
+
+        # Port status of 1 (smart_load) means the port is active/enabled
+        status = self._device_data.get(f"smart_port{self._port}_status")
+        if status is not None:
+            return int(status) == 1
+        return None
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Enable the smart load port."""
+        action_name = f"smart load {self._port}"
+        try:
+            _LOGGER.debug(
+                "Enabling %s via CLOUD API for device %s",
+                action_name,
+                self._serial,
+            )
+
+            self._optimistic_state = True
+            self.async_write_ha_state()
+
+            device = self._get_device_or_raise()
+            success = await device.enable_smart_load(self._port)
+            if not success:
+                raise HomeAssistantError(f"Failed to enable {action_name}")
+
+            _LOGGER.info(
+                "Successfully enabled %s via CLOUD API for device %s",
+                action_name,
+                self._serial,
+            )
+
+            await device.refresh()
+            await asyncio.sleep(1.0)
+            await self.coordinator.async_refresh()
+
+            self._optimistic_state = None
+            self.async_write_ha_state()
+
+        except HomeAssistantError:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            raise
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to enable %s for device %s: %s",
+                action_name,
+                self._serial,
+                e,
+            )
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            raise HomeAssistantError(f"Failed to enable {action_name}: {e}") from e
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Disable the smart load port."""
+        action_name = f"smart load {self._port}"
+        try:
+            _LOGGER.debug(
+                "Disabling %s via CLOUD API for device %s",
+                action_name,
+                self._serial,
+            )
+
+            self._optimistic_state = False
+            self.async_write_ha_state()
+
+            device = self._get_device_or_raise()
+            success = await device.disable_smart_load(self._port)
+            if not success:
+                raise HomeAssistantError(f"Failed to disable {action_name}")
+
+            _LOGGER.info(
+                "Successfully disabled %s via CLOUD API for device %s",
+                action_name,
+                self._serial,
+            )
+
+            await device.refresh()
+            await asyncio.sleep(1.0)
+            await self.coordinator.async_refresh()
+
+            self._optimistic_state = None
+            self.async_write_ha_state()
+
+        except HomeAssistantError:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            raise
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to disable %s for device %s: %s",
+                action_name,
+                self._serial,
+                e,
+            )
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            raise HomeAssistantError(f"Failed to disable {action_name}: {e}") from e
+
+    @property
+    def available(self) -> bool:
+        """Smart load control requires cloud API and GridBOSS device."""
+        return (
+            self.coordinator.has_http_api()
+            and self._device_data.get("type") == "gridboss"
+        )

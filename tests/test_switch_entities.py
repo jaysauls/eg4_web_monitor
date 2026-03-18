@@ -22,6 +22,7 @@ from custom_components.eg4_web_monitor.switch import (
     EG4OffGridModeSwitch,
     EG4WorkingModeSwitch,
     EG4DSTSwitch,
+    EG4SmartLoadSwitch,
 )
 
 
@@ -722,3 +723,154 @@ class TestDSTSwitch:
 
         with pytest.raises(HomeAssistantError, match="Failed to"):
             await switch.async_turn_on()
+
+
+# ── Smart Load Switch ────────────────────────────────────────────────
+
+
+def _mock_gridboss_coordinator(
+    *,
+    serial: str = "4434850035",
+    port_statuses: dict[int, int] | None = None,
+    has_http: bool = True,
+) -> MagicMock:
+    """Build a mock coordinator with a GridBOSS device for smart load tests."""
+    coordinator = _mock_coordinator(
+        has_http=has_http,
+        model="GridBOSS",
+        serial=serial,
+    )
+    # Override device type to gridboss
+    coordinator.data["devices"][serial]["type"] = "gridboss"
+
+    # Set smart port statuses (default: port 2 is smart_load)
+    statuses = port_statuses or {1: 0, 2: 1, 3: 0, 4: 0}
+    for port, status in statuses.items():
+        coordinator.data["devices"][serial][f"smart_port{port}_status"] = status
+
+    # Mock MID device object with smart load methods
+    mock_mid = MagicMock()
+    mock_mid.refresh = AsyncMock()
+    mock_mid.enable_smart_load = AsyncMock(return_value=True)
+    mock_mid.disable_smart_load = AsyncMock(return_value=True)
+    coordinator._get_device_object = MagicMock(return_value=mock_mid)
+
+    return coordinator
+
+
+class TestSmartLoadSwitch:
+    """Test SmartLoad switch entity for GridBOSS devices."""
+
+    def test_is_on_when_port_active(self):
+        """Port with status 1 (smart_load) should report is_on True."""
+        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 1, 3: 0, 4: 0})
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        assert switch.is_on is True
+
+    def test_is_off_when_port_disabled(self):
+        """Port with status 0 (unused) should report is_on False."""
+        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 0, 3: 0, 4: 0})
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        assert switch.is_on is False
+
+    def test_is_on_none_when_missing(self):
+        """Missing port status should return None."""
+        coordinator = _mock_gridboss_coordinator()
+        # Remove the port status key
+        del coordinator.data["devices"]["4434850035"]["smart_port2_status"]
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        assert switch.is_on is None
+
+    def test_optimistic_overrides(self):
+        """Optimistic state takes precedence over actual state."""
+        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 0, 3: 0, 4: 0})
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        switch._optimistic_state = True
+        assert switch.is_on is True
+
+    def test_available_with_cloud_api(self):
+        """Switch should be available with cloud API and gridboss type."""
+        coordinator = _mock_gridboss_coordinator(has_http=True)
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        assert switch.available is True
+
+    def test_unavailable_without_cloud_api(self):
+        """Switch should not be available without cloud API."""
+        coordinator = _mock_gridboss_coordinator(has_http=False)
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        assert switch.available is False
+
+    @pytest.mark.asyncio
+    async def test_turn_on(self):
+        """Turn on calls enable_smart_load with correct port."""
+        coordinator = _mock_gridboss_coordinator()
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        _prep(switch)
+        await switch.async_turn_on()
+
+        mid = coordinator._get_device_object("4434850035")
+        mid.enable_smart_load.assert_called_once_with(2)
+
+    @pytest.mark.asyncio
+    async def test_turn_off(self):
+        """Turn off calls disable_smart_load with correct port."""
+        coordinator = _mock_gridboss_coordinator()
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        _prep(switch)
+        await switch.async_turn_off()
+
+        mid = coordinator._get_device_object("4434850035")
+        mid.disable_smart_load.assert_called_once_with(2)
+
+    @pytest.mark.asyncio
+    async def test_turn_on_failure_raises(self):
+        """API failure on enable should raise HomeAssistantError."""
+        coordinator = _mock_gridboss_coordinator()
+        mid = coordinator._get_device_object("4434850035")
+        mid.enable_smart_load = AsyncMock(return_value=False)
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        _prep(switch)
+
+        with pytest.raises(HomeAssistantError, match="Failed to enable"):
+            await switch.async_turn_on()
+
+    @pytest.mark.asyncio
+    async def test_turn_off_failure_raises(self):
+        """API failure on disable should raise HomeAssistantError."""
+        coordinator = _mock_gridboss_coordinator()
+        mid = coordinator._get_device_object("4434850035")
+        mid.disable_smart_load = AsyncMock(return_value=False)
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        _prep(switch)
+
+        with pytest.raises(HomeAssistantError, match="Failed to disable"):
+            await switch.async_turn_off()
+
+    @pytest.mark.asyncio
+    async def test_setup_creates_smart_load_switches(self, hass):
+        """Smart load switches should be created for active smart load ports."""
+        coordinator = _mock_gridboss_coordinator(port_statuses={1: 1, 2: 1, 3: 0, 4: 2})
+        entry = MagicMock()
+        entry.runtime_data = coordinator
+
+        entities = []
+        await async_setup_entry(hass, entry, lambda e, **kw: entities.extend(e))
+
+        smart_load_switches = [e for e in entities if isinstance(e, EG4SmartLoadSwitch)]
+        # Only ports 1 and 2 have status==1 (smart_load); port 4 is ac_couple
+        assert len(smart_load_switches) == 2
+        ports = {s._port for s in smart_load_switches}
+        assert ports == {1, 2}
+
+    @pytest.mark.asyncio
+    async def test_setup_skips_when_no_active_ports(self, hass):
+        """No smart load switches if no ports have status 1."""
+        coordinator = _mock_gridboss_coordinator(port_statuses={1: 0, 2: 0, 3: 0, 4: 2})
+        entry = MagicMock()
+        entry.runtime_data = coordinator
+
+        entities = []
+        await async_setup_entry(hass, entry, lambda e, **kw: entities.extend(e))
+
+        smart_load_switches = [e for e in entities if isinstance(e, EG4SmartLoadSwitch)]
+        assert len(smart_load_switches) == 0
