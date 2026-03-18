@@ -9,6 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 if TYPE_CHECKING:
     from homeassistant.components.switch import SwitchEntity
@@ -819,12 +820,16 @@ class _StormModeCallData:
         self.data: dict[str, Any] = {"serial": serial, "enable": enable}
 
 
-class EG4SmartLoadSwitch(EG4BaseSwitch):
+class EG4SmartLoadSwitch(EG4BaseSwitch, RestoreEntity):
     """Switch to enable/disable a GridBOSS smart load port.
 
     Each smart load port (1-4) on a GridBOSS MID device can be independently
     enabled or disabled via the cloud API.  One switch entity is created per
-    active smart load port (port status == 1).
+    active smart load port (port status == "smart_load").
+
+    The coordinator only tracks the port *mode* (unused/smart_load/ac_couple),
+    not the enabled/disabled state of the output.  This switch therefore keeps
+    its own commanded state and uses RestoreEntity to survive HA restarts.
     """
 
     def __init__(
@@ -841,6 +846,7 @@ class EG4SmartLoadSwitch(EG4BaseSwitch):
             port: Smart load port number (1-4).
         """
         self._port = port
+        self._commanded_state: bool | None = None
         super().__init__(
             coordinator=coordinator,
             serial=serial,
@@ -849,13 +855,24 @@ class EG4SmartLoadSwitch(EG4BaseSwitch):
             icon="mdi:lightning-bolt",
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Restore last known state on startup."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None:
+            self._commanded_state = last_state.state == "on"
+
     @property
     def is_on(self) -> bool | None:
         """Return True if smart load port is enabled."""
         if self._optimistic_state is not None:
             return self._optimistic_state
 
-        # Port status of 1 (smart_load) means the port is active/enabled
+        # Use last commanded state (persisted across restarts via RestoreEntity)
+        if self._commanded_state is not None:
+            return self._commanded_state
+
+        # No commanded state yet — assume enabled if port is configured as smart_load
         status = self._device_data.get("sensors", {}).get(
             f"smart_port{self._port}_status"
         )
@@ -887,27 +904,23 @@ class EG4SmartLoadSwitch(EG4BaseSwitch):
                 self._serial,
             )
 
-            await device.refresh()
-            await asyncio.sleep(1.0)
-            await self.coordinator.async_refresh()
+            self._commanded_state = True
 
-            self._optimistic_state = None
-            self.async_write_ha_state()
-
-        except HomeAssistantError:
-            self._optimistic_state = None
-            self.async_write_ha_state()
-            raise
         except Exception as e:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            if isinstance(e, HomeAssistantError):
+                raise
             _LOGGER.error(
                 "Failed to enable %s for device %s: %s",
                 action_name,
                 self._serial,
                 e,
             )
+            raise HomeAssistantError(f"Failed to enable {action_name}: {e}") from e
+        finally:
             self._optimistic_state = None
             self.async_write_ha_state()
-            raise HomeAssistantError(f"Failed to enable {action_name}: {e}") from e
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable the smart load port."""
@@ -933,27 +946,23 @@ class EG4SmartLoadSwitch(EG4BaseSwitch):
                 self._serial,
             )
 
-            await device.refresh()
-            await asyncio.sleep(1.0)
-            await self.coordinator.async_refresh()
+            self._commanded_state = False
 
-            self._optimistic_state = None
-            self.async_write_ha_state()
-
-        except HomeAssistantError:
-            self._optimistic_state = None
-            self.async_write_ha_state()
-            raise
         except Exception as e:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+            if isinstance(e, HomeAssistantError):
+                raise
             _LOGGER.error(
                 "Failed to disable %s for device %s: %s",
                 action_name,
                 self._serial,
                 e,
             )
+            raise HomeAssistantError(f"Failed to disable {action_name}: {e}") from e
+        finally:
             self._optimistic_state = None
             self.async_write_ha_state()
-            raise HomeAssistantError(f"Failed to disable {action_name}: {e}") from e
 
     @property
     def available(self) -> bool:

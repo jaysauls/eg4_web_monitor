@@ -764,35 +764,43 @@ class TestSmartLoadSwitch:
     """Test SmartLoad switch entity for GridBOSS devices."""
 
     def test_is_on_when_port_active(self):
-        """Port with status 1 (smart_load) should report is_on True."""
+        """Port with status smart_load and no commanded state defaults to True."""
         coordinator = _mock_gridboss_coordinator(
             port_statuses={1: "unused", 2: "smart_load", 3: "unused", 4: "unused"}
         )
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         assert switch.is_on is True
 
-    def test_is_off_when_port_disabled(self):
-        """Port with status 0 (unused) should report is_on False."""
+    def test_is_off_when_port_unused(self):
+        """Port with status unused and no commanded state defaults to False."""
         coordinator = _mock_gridboss_coordinator(
             port_statuses={1: "unused", 2: "unused", 3: "unused", 4: "unused"}
         )
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         assert switch.is_on is False
 
+    def test_commanded_state_overrides_sensor(self):
+        """Commanded state takes precedence over sensor status."""
+        coordinator = _mock_gridboss_coordinator(
+            port_statuses={1: "unused", 2: "smart_load", 3: "unused", 4: "unused"}
+        )
+        switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        # Sensor says "smart_load" (would be True), but commanded state is False
+        switch._commanded_state = False
+        assert switch.is_on is False
+
     def test_is_on_none_when_missing(self):
-        """Missing port status should return None."""
+        """Missing port status and no commanded state should return None."""
         coordinator = _mock_gridboss_coordinator()
-        # Remove the port status key
         del coordinator.data["devices"]["4434850035"]["sensors"]["smart_port2_status"]
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         assert switch.is_on is None
 
-    def test_optimistic_overrides(self):
-        """Optimistic state takes precedence over actual state."""
-        coordinator = _mock_gridboss_coordinator(
-            port_statuses={1: "unused", 2: "unused", 3: "unused", 4: "unused"}
-        )
+    def test_optimistic_overrides_commanded(self):
+        """Optimistic state takes precedence over commanded state."""
+        coordinator = _mock_gridboss_coordinator()
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
+        switch._commanded_state = False
         switch._optimistic_state = True
         assert switch.is_on is True
 
@@ -810,7 +818,7 @@ class TestSmartLoadSwitch:
 
     @pytest.mark.asyncio
     async def test_turn_on(self):
-        """Turn on calls enable_smart_load with correct port."""
+        """Turn on calls enable_smart_load and sets commanded state."""
         coordinator = _mock_gridboss_coordinator()
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         _prep(switch)
@@ -818,10 +826,12 @@ class TestSmartLoadSwitch:
 
         mid = coordinator._get_device_object("4434850035")
         mid.enable_smart_load.assert_called_once_with(2)
+        assert switch._commanded_state is True
+        assert switch.is_on is True
 
     @pytest.mark.asyncio
     async def test_turn_off(self):
-        """Turn off calls disable_smart_load with correct port."""
+        """Turn off calls disable_smart_load and sets commanded state."""
         coordinator = _mock_gridboss_coordinator()
         switch = EG4SmartLoadSwitch(coordinator, "4434850035", 2)
         _prep(switch)
@@ -829,6 +839,8 @@ class TestSmartLoadSwitch:
 
         mid = coordinator._get_device_object("4434850035")
         mid.disable_smart_load.assert_called_once_with(2)
+        assert switch._commanded_state is False
+        assert switch.is_on is False
 
     @pytest.mark.asyncio
     async def test_turn_on_failure_raises(self):
